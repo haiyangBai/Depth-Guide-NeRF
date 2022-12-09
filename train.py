@@ -15,8 +15,8 @@ from collections import defaultdict
 from torch.utils.data import DataLoader
 from datasets.dataset import DoNeRFDataset
 from torch.optim import Adam, lr_scheduler
-from models.model import DepthNeRF, PosEmbedding
-from models.render import render_rays
+from models.model import DepthNeRF, PosEmbedding, TestModel
+from models.render import render_rays, test_render
 
 
 # Misc
@@ -86,33 +86,45 @@ def get_val_dataloader(root_dir, split='train', idx=0):
 def train():
     
     chunk       = 1024*64
-    tot_iters   = 1000000
+    tot_iters   = 500000 + 1
     batch_size  = 4096
     learning_rate = 8e-4
     dis         = 0.4
     n_samples   = 2
-    d_loss_cof  = 0.
+    d_loss_cof  = 0.01
     skip        = 1
-    desc        = '22'
+    down_sp     = 1
+    desc        = '41'
     root        = '/home/baihy/datasets/DONeRF-data/'
-    scene_name  = 'barbershop'
-    root_dir    = root + scene_name
+    expname     = 'barbershop'
+    root_dir    = root + expname
     device      = torch.device('cuda')
-    writer      = SummaryWriter(f'logs-bhy/{scene_name}-{desc}')
+    writer      = SummaryWriter(f'logs-bhy/{expname}-{desc}')
     sample_scheduler = ['depth_sample', 'gauss_sample']
+    
+    with open(os.path.join(root, expname, 'dataset_info.json'), 'r') as f:
+        info = json.load(f)
+    
+    W, H = info['resolution']
+    focal = 0.5 * W / np.tan(0.5 * info['camera_angle_x'])
+    K = np.array([[focal, 0, 0.5*W],
+                [0, focal, 0.5*H],
+                [0, 0, 1]])
     
     xyz_embedding = PosEmbedding(3, 10).to(device)
     dir_embedding = PosEmbedding(3, 4).to(device)
     embeddings = [xyz_embedding, dir_embedding]
     
-    train_dataset = DoNeRFDataset(root_dir, 'train', data_skip=skip)
+    train_dataset = DoNeRFDataset(root_dir, 'train', data_skip=skip, download_sample=down_sp)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=64)
     
-    val_dataset = DoNeRFDataset(root_dir, 'val')
+    val_dataset = DoNeRFDataset(root_dir, 'val', download_sample=down_sp)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=64)  
     
     
     model = DepthNeRF(D=10, W=256, in_channels_xyz=63, in_channels_dir=27, skips=[4, 8])
+    test_model = TestModel()
+    test_model = test_model.to(device)
     model = model.to(device)
     optimizer = Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999))
     
@@ -121,8 +133,8 @@ def train():
     milestones = list(range(3, epochs, 3))
     # scheduler = lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
     # scheduler = lr_scheduler.StepLR(optimizer, gamma=0.8)
-    # scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.6)
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=2, eta_min=5e-6)    
+    # scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=milestones, gamma=0.8)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=5e-8)    
     
     # training
     t_start = time.time()
@@ -133,6 +145,13 @@ def train():
             rgbs = sample['rgbs'].to(device)
             depth = sample['depth'].to(device)
             rays = sample['rays'].to(device)
+            
+            # rgb = test_render(model, embeddings, rays, depth, dis=dis, n_samples=n_samples)
+            # loss = img2mse(rgb, rgbs)
+            # if (epoch*iters+it) % 500 == 0 and it > 0:  
+            #     print(loss.item())
+            
+            
             
             B = rgbs.shape[0]
                         
@@ -154,7 +173,7 @@ def train():
             
             loss.backward()
             optimizer.step()
-            # del results
+            del results
             
             if (epoch*iters+it) % 500 == 0 and it > 0:  
                 print(f" [{(time.time()-t_start):.2f}s] [LR {optimizer.state_dict()['param_groups'][0]['lr']:.6f}]", 
@@ -165,11 +184,18 @@ def train():
                 writer.add_scalar('train/lr', optimizer.state_dict()['param_groups'][0]['lr'], epoch)
             
             if (epoch*iters+it) % 20000 == 0 and it > 0:
+                path = os.path.join(root, expname, 'iters-{:06d}.pth'.format(epoch*iters+it))
+                torch.save({
+                    'network_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, path)
+                print('Saved checkpoints at', path)
+                
                 with torch.no_grad():
                     results = defaultdict(list)
                     target_rgb = []
                     target_depth = []
-                    for sample in tqdm(val_dataloader, desc=f"Validating [{scene_name}] Epoch:{epoch}"):
+                    for sample in tqdm(val_dataloader, desc=f"Validating [{expname}] Epoch:{epoch}"):
                     # sample: {'rays': (bz, 6), 'rgbs': (bz, 3), 'depth': (bz, 1)}
                         target_rgb.append(sample['rgbs'])
                         target_depth.append(sample['depth'])
@@ -188,11 +214,13 @@ def train():
                                 
                     for k, v in results.items():
                         results[k] = torch.cat(v, 0)
-                    target_rgb = torch.cat(target_rgb, 0).reshape(800, 800, 3).cpu()
-                    target_depth = torch.cat(target_depth, 0).reshape(800, 800).cpu()
+                        
+                    resolution = 800 // down_sp
+                    target_rgb = torch.cat(target_rgb, 0).reshape(resolution, resolution, 3).cpu()
+                    target_depth = torch.cat(target_depth, 0).reshape(resolution, resolution).cpu()
         
-                    rgbs = results['rgb'].reshape(800, 800, 3).cpu()
-                    depth = results['depth'].reshape(800, 800).cpu()
+                    rgbs = results['rgb'].reshape(resolution, resolution, 3).cpu()
+                    depth = results['depth'].reshape(resolution, resolution).cpu()
                                                                 
                     val_loss = img2mse(rgbs, target_rgb)
                     depth_loss = img2mse(depth, target_depth)
@@ -207,11 +235,12 @@ def train():
                     depth = torch.cat([target_depth, depth], 1)
                     val_rgb = img_to8b(np.array(img.detach()))
                     val_depth = depth_to8b(np.array(depth.detach()))
-                    result_dir = f'logs-bhy/{scene_name}-{desc}'
+                    result_dir = f'logs-bhy/{expname}-{desc}'
                     os.makedirs(result_dir, exist_ok=True)
                     cv2.imwrite(os.path.join(result_dir, f'rgb_{epoch*iters+it}.png'), val_rgb)
                     cv2.imwrite(os.path.join(result_dir, f'depth_{epoch*iters+it}.png'), val_depth)
                     del target_rgb, rgbs, depth, img, val_rgb, val_depth, results
+                    
         scheduler.step()
     
                     
