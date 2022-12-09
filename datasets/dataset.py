@@ -14,23 +14,39 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class DoNeRFDataset(Dataset):
-    def __init__(self, root_dir, split='train', data_skip=1):
+    def __init__(self, root_dir, split='train', data_skip=1, download_sample=1):
         super(DoNeRFDataset, self).__init__()
         self.root_dir = root_dir
         self.split = split
         self.data_skip = data_skip
         self.white_back = True
+        self.download_sample = download_sample
         self.read_meta()
     
-    def load_depth_image(self, depth_path):
+    def load_depth_image(self, depth_path, K, download_sample):
+        
         depth = np.load(depth_path)
-        return torch.FloatTensor(depth.reshape(-1, 1))
+        u = range(0, depth.shape[0])
+        v = range(0, depth.shape[1])
+        
+        u, v = np.meshgrid(u, v)
+        u = u.astype(float)
+        v = v.astype(float)
+        
+        Z = depth.astype(float)
+        X = (u - K[0, 2]) * Z / K[0, 0]
+        Y = (v - K[1, 2]) * Z / K[1, 1]
+        
+        sample_position = np.sqrt(X**2 + Y**2 + Z**2)
+        return torch.FloatTensor(sample_position.reshape(-1, 1))
     
-    def load_rgb_image(self, rgb_path):
+    def load_rgb_image(self, rgb_path, download_sample):
+        H, W = self.resolution
         img = imageio.v2.imread(rgb_path)
         img = (np.array(img) / 255.).astype(np.float32) # 4 channels (RGBA)
         if self.H != img.shape[0]:
-            img = cv2.resize(img, self.resolution, interpolation=cv2.INTER_AREA)
+            img = cv2.resize(img, (H, W), interpolation=cv2.INTER_AREA)
+            img = cv2.resize(img, (H//download_sample, W, download_sample), interpolation=cv2.INTER_AREA)
         img = self.transform(img)               # (4, H, W)
         img = img.view(4, -1).permute(1, 0)     # (H*W, 4)
         img = img[:, :3] * img[:, -1:] + (1 - img[:, -1:])
@@ -60,6 +76,12 @@ class DoNeRFDataset(Dataset):
         self.W, self.H = self.resolution
         self.focal = 0.5 * self.W / np.tan(0.5 * camera_angle_x)
         
+        K = np.array([
+            [self.focal, 0, 0.5*self.W],
+            [0, self.focal, 0.5*self.H],
+            [0, 0, 1]
+        ])
+        
         with open(os.path.join(self.root_dir, f'transforms_{self.split}.json'), 'r') as f:
             self.meta = json.load(f)
 
@@ -73,7 +95,7 @@ class DoNeRFDataset(Dataset):
             for frame in tqdm(self.meta['frames'][::self.data_skip], desc='Loading Train Dataset'):
                 # get poses/rays
                 pose = torch.FloatTensor(frame['transform_matrix'])[:3, :4]
-                rays_o, rays_d = self.pose_to_rays(self.H, self.W, self.focal, pose)
+                rays_o, rays_d = self.pose_to_rays(self.H//self.download_sample, self.W//self.download_sample, self.focal, pose)
                 self.all_rays.append(torch.cat([rays_o, rays_d], 1))
 
                 # get rgbs and depth
@@ -81,8 +103,8 @@ class DoNeRFDataset(Dataset):
                 depth_path = rgb_path.replace('.png', '_depth.npy')
                 self.img_paths.append(rgb_path)
                 
-                rgb = self.load_rgb_image(rgb_path)
-                depth = self.load_depth_image(depth_path)
+                rgb = self.load_rgb_image(rgb_path, self.download_sample)
+                depth = self.load_depth_image(depth_path, K, self.download_sample)
                 self.all_rgbs.append(rgb)
                 self.all_depth.append(depth)
 
@@ -98,8 +120,8 @@ class DoNeRFDataset(Dataset):
             rgb_path = os.path.join(self.root_dir, f"{frame['file_path']}.png")
             depth_path = rgb_path.replace('.png', '_depth.npy')
             
-            self.rgb = self.load_rgb_image(rgb_path)        # (H*W, 3)
-            self.depth = self.load_depth_image(depth_path)  # (H*W, 1)
+            self.rgb = self.load_rgb_image(rgb_path, self.download_sample)        # (H*W, 3)
+            self.depth = self.load_depth_image(depth_path, K, self.download_sample)  # (H*W, 1)
             self.rays = torch.cat([rays_o , rays_d], 1)     # (H*W, 6)
             
         elif self.split == 'test':
@@ -112,7 +134,7 @@ class DoNeRFDataset(Dataset):
         if self.split == 'train':
             return self.all_rays.shape[0]
         elif self.split == 'val':
-            return self.W*self.H
+            return self.W*self.H//(self.download_sample**2)
         elif self.split == 'test':
             return 0
 
@@ -139,16 +161,17 @@ if __name__ == '__main__':
     from torch.utils.data import DataLoader
 
     root_dir = '/home/baihy/datasets/DONeRF-data/barbershop'
-    dataset = DoNeRFDataset(root_dir, 'val', data_skip=10,)
+    dataset = DoNeRFDataset(root_dir, 'train', data_skip=10, download_sample=1)
     from torch.utils.data import DataLoader
     
-    data = DataLoader(dataset, batch_size=2048, num_workers=64)
+    data = DataLoader(dataset, batch_size=1, num_workers=64)
     print(len(data))
     for i, sample in enumerate(data):
         rgb = sample['rgbs']
         rays = sample['rays']
         depth = sample['depth']
         print(i, rgb.shape, rays.shape, depth.shape)
+        break
     
    
     
